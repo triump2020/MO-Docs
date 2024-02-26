@@ -10,7 +10,7 @@ Issue: https://github.com/matrixorigin/matrixone/issues/10397
 
 ## 1. Introduction for snapshot read
 
-快照是备份数据的一种有效方式, 用户可以通过命令为account/database/table 创建snapshot.
+快照是备份数据的一种有效方式, 用户可以通过命令为cluster/account/database/table 创建snapshot.
 
 当用户创建完snapshot之后，事务可以读取用户指定时间点或者快照ID的数据, 即read at snapshot,主要用于数据恢复/回滚场景。
 
@@ -323,11 +323,59 @@ func updatePartitionOfPull(
 
 
 
-#### 2.2.2  Front 设计
+#### 2.2.2  Parser 设计
+
+#### 2.2.2.1 ast tree 设计
+
+```go
+   type TableName struct {
+	  TableExpr
+	  objName
+	  snapshotFlag *SnapShotFlag
+   }
+
+   type SnapShotFlag struct {
+	   HasSnapShot bool
+	   SnapShotTs  string
+   }
+```
+
+```go
+    snapshot_flag_opt:
+    {
+        $$ = $1,
+    }
+|   '@' STRING
+    {
+        $$ = &tree.SnapShotFlag{
+            HasSnapShot: true,
+            SnapShotTs: $2,
+        }
+    }
+
+	table_name:
+    ident snapshot_flag_opt
+    {
+        prefix := tree.ObjectNamePrefix{ExplicitSchema: false}
+        $$ = tree.NewTableName(tree.Identifier($1.Compare()), prefix, $2)
+    }
+|   ident '.' ident snapshot_flag_opt
+    {
+        prefix := tree.ObjectNamePrefix{SchemaName: tree.Identifier($1.Compare()), ExplicitSchema: true}
+        $$ = tree.NewTableName(tree.Identifier($3.Compare()), prefix, $2)
+    }
+```
+
+#### 2.2.3  Front 设计
+    // @mochen 是否需要修改内部执行sql？
 
 
-
-#### 2.2.3 Plan 设计
+#### 2.2.4 Plan 设计
+    // 主要是修改
+	buildFrom:
+	   buildTable:
+	       *tree.TableName
+		   //在Node中增加snapshotTs信息
 
 
 
