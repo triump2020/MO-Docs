@@ -28,224 +28,105 @@ snapshot的创建，查询，删除。
 
 - 涉及到快照读语句的语法
   
-    1.用户需要读取某个表的快照/历史数据, 读取表t的快照ID为xxxx 的数据. 
+1. 用户需要读取某个表的快照/历史数据, 读取表t的快照ID为xxxx 的数据. 
 
    ```sql
    show snapshots;
    
 	select * from t@snapshot1; //if schema changed between snapshot1 and now?
 	
-   select * from (select * from t@snapshot1)
+   select * from (select * from t@snapshot1) // snapshot1 是类型为types.TS 的时间戳
+                                             // 同时支持snapshot name/id
    
    select * from t1@snapshot1 join t2@snapshot2 on t1.x = t2.y 
    
    //join t1's latest snapshot data with t2's snapshot data at snapshot2.
    insert into t3 select * from t1 join t2@snapshot2 on t1.x = t2.y  
    
-   
-   
    ```
-
-   2. **读取两个snapshot 之间的 diff**
-
-      ```sql
-      select * from t@snapshot1...snapshot2;// read diff between snapshot1 and snapshot2
-      ```
-
-   3. 从快照中导入全量/增量数据
-
+   
+2. **读取两个snapshot 之间的 diff,主要为了支持CDC**
+   
+   ```sql
+      select * (增加列区分 是diff insert or delete ) from t@snapshot1 diff snapshot2;
+                                            // read diff between snapshot1 and snapshot2
+                                            // 参考 git diff 的语法
+   ```
+   
+3. 从快照中导入全量/增量数据
+   
       ```sql
        
        begin;
        create table t2;
        insert into t2 select * from t1@snapshot1;// full backup
          
-       insert into t2 select * from t1@snapshot1...snapshot2 // incremental backup.
+       insert into t2 select * from t1@snapshot1 diff snapshot2 // incremental backup.
        commit;
-      ```
+   ```
 
-      
 
-- Ast 
+- Ast
 
-​       Ast 需要支持snapshot read 的 相关语法.
+   Ast 需要支持snapshot read 相关语法, 处理from
 
 - Plan 
 
+   在bind 时，需要支持 from t1@snapshot 语法, 生成对应的 snapshot da/table 对象.
+
 - 分布式 Scope 
 
-    将plan 转换为可执行的分布式scope 时，需要处理table scan 节点.
+    将plan 转换为可执行的分布式scope 时，需要用snapshot table 对象.
 
-- disttae 从TN 去 snapshot
+- Disttae 从TN 去 获取 旧的 snapshot data
 
-  1. 快照读事务可能需要从TN 中获取较旧的ckp, 而当前CN 状态机(PartitionState与Catalog)中的数据是基于一个最新的ckp + logtail，所以需要
-  从TN 中拉取 旧的ckp, 可以通过RPC 方式，与TN 新建一条tcp链接去获取某个表的指定时间戳的ckp(是否新建链接还是复用已有的push 通道待定)?
-  <br>
-
-  2. 快照读事务需要一个独立的状态机，将旧的ckp 数据apply 到此状态机中. 当事务提交后，释放状态机.
-  <br>
-
-  3. 如果请求的数据版本在当前CN 状态机中已经存在，可以复用已有状态机(第一版本，可以暂时不复用，减少复杂度)
-
+1. 快照读可能需要从TN 中获取较旧的ckp, 而当前CN 状态机(PartitionState与Catalog)中的数据是基于一个最新的ckp + logtail，所以需要从TN 中拉取 旧的ckp, 可以通过RPC 方式，与TN 新建一条tcp链接去获取某个表的指定时间戳的ckp(是否新建链接还是复用已有的push 通道待定)?
+<br>
+  
+2. 快照读需要一个独立的状态机，将旧的ckp 数据apply 到此状态机中. 当事务提交后，释放状态机.
+    <br>
+  
+3. 如果请求的数据版本在当前CN 状态机中已经存在，可以复用已有状态机
 
 
 ### 2.2 详细设计
 
 #### 2.2.1 Disttae 设计
 
-​       **default engine** : disttae 中目前已存在的global engine, 其生命周期是全局的.
+  **latest snapshot** : distate 中最新的快照数据，是基于最新的checkpoint + logtail apply 之后生成的.
 
-​       **snapshot engine**:  一个txn 在涉及到snapshot read 时，会创建对应snapshot engine, 这个engine 的生命周期与事务一致.
+  **global txn op** :  用户每开启一个事务，需要创建一个global txn op, 其负责事务的提交，与TN 之间交互等.
+                              如果事务需要进行快照读，需要clone出一个新的snapshot op, 用于读取快照数据, 
 
-​       一个txn, 内部会有多个snapshot , 对于每一个snapshot 会创建一个只读的snapshot engine,  其实default engine  本质上也是一个 snapshot engine , 只不过这个engine 服务于latest snapshot , 且是可写的.  
+​                            一个global txn op 中可以clone多个snapshot op.
 
-​         front 只要遇到 select/join...... from table@snpashot 子句时，就需要 创建对应的snapshot engine ,  将这个snapshot engine 注册到txn 中,  当txn commit/rollback 时，disttae 会自动销毁这个snapshot engine.
+  disttae 中对于每个snapshot 会对应一个独立的状态机，用于存储快照数据, latest snapshot 只是snapshot的特例.  如果快照读需要历史数据， distate会从TN中拉取，并apply到每个snapshot对应的状态机中; 
+  如果请求的数据版本在当前CN latest snapshot 中已经存在，可以复用已有状态机. disttae 中 snapshot 的释放策略待定.
 
-​        front 在 bind 时，需要从 snapshot engine 中open snapshot database ,  然后从snapshot database 中open 一个 snapshot table.
+  当事务进行快照读时，sql  layer应调用txnOp.CloneSnapshotOp() 生成一个新的snapshot op, 用于读取快照数据, 并通过调用  Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot op 与 snapshot database 绑定;  调用snapshotDb.Relation(..., tableName) open 一个snapshot table 对象，最后通过调用snapshotTable.NewReader(...)  生成一个snapshot reader对象读取snapshot数据.
 
-​       compute layer 在 compile  table scan node 时，需要调用 snapshot table 的 ranges 接口.
+  disttae engine 全局只有一个.
 
-##### 2.2.1.1 snap engine/db/table 设计
-​    每个snapshot/时间戳  对应一个snapshot engine .  **这个engine 是只读的**，会实现  disttae/engine/types.go   Engine interface 里的如下只读接口,  其他接口实现留空.
+  在快照读功能之前，一个事务只有一个 txn op, 且txn op 与 distate.Transaction 对象一一对应;
+  在快照读功能之后，一个事务会有多个txn op 对象，distate.Transaction 对象与txn op 为一对多关系.
 
-```go
-type SnapEngine struct {
-	sync.RWMutex
-	mp         *mpool.MPool
-	fs         fileservice.FileService
-	ls         lockservice.LockService
-	qs         queryservice.QueryService
-	hakeeper   logservice.CNHAKeeperClient
-	us         udf.Service
-	cli        client.TxnClient
-	idGen      IDGenerator
-	catalog    *cache.CatalogCache // ==元数据的快照==
-	tnID       string
-	partitions map[[2]uint64]*logtailreplay.Partition // ==table data 的快照==
-	packerPool *fileservice.Pool[*types.Packer]
 
-	// XXX related to cn push model
-	pClient pushClien
-}
-
-type Engine interface {
-    
-    // return all database names
-    Databases(ctx context.Context, op client.TxnOperator) (databaseNames []string, err error)
-
-	// Database open a handle for a database
-	Database(ctx context.Context, databaseName string, op client.TxnOperator) (Database, error)
-
-	// Nodes returns all nodes for worker jobs. isInternal, tenant, cnLabel are
-	// used to filter CN servers.
-	Nodes(isInternal bool, tenant string, username string, cnLabel map[string]string) (cnNodes Nodes, err error)
-
-	// Hints returns hints of engine features
-	// return value should not be cached
-	// since implementations may update hints after engine had initialized
-	Hints() Hints
-
-	NewBlockReader(ctx context.Context, num int, ts timestamp.Timestamp, expr *plan.Expr, ranges []byte, tblDef *plan.TableDef, proc any) ([]Reader, error)
-
-	// Get database name & table name by table id
-	GetNameById(ctx context.Context, op client.TxnOperator, tableId uint64) (dbName string, tblName string, err error)
-
-	// Get relation by table id
-	GetRelationById(ctx context.Context, op client.TxnOperator, tableId uint64) (dbName string, tblName string, rel Relation, err error)
-
-	// AllocateIDByKey allocate a globally unique ID by key.
-	AllocateIDByKey(ctx context.Context, key string) (uint64, error)
-
-	// Stats returns the stats info of the key.
-	// If sync is true, wait for the stats info to be updated, else,
-	// just return nil if the current stats info has not been initialized.
-	Stats(ctx context.Context, key pb.StatsInfoKey, sync bool) *pb.StatsInfo
-    
-}
-
-```
-
- 从snap engine 中 open 一个 snapshot database 之后，就可以调用Database 相关的接口：
+##### 2.2.1.1 TxnOp 中增加CloneSnapshotOp 接口
 
 ```go
-type snapDB struct {
-	databaseId        uint64
-	databaseName      string
-	databaseType      string
-    snapshot          TS
-	databaseCreateSql string
-	txn               *Transaction
+type TxnOp interface {
+	//clone read-only snapshot op from parent op.
+    CloneSnapshotOp(snapshot types.TS) TxnOp
 }
-
-type Database interface {
-	Relations(context.Context) ([]string, error)
-	Relation(context.Context, string, any) (Relation, error)
-	GetDatabaseId(context.Context) string
-	IsSubscription(context.Context) bool
-	GetCreateSql(context.Context) string
-}
-
 ```
+  CloneSnapshotOp 通过global TxnOp clone出一个新的snapshot op,其snapshot ts 由用户指定，用于读取快照数据, 如果用户指定的snapshot ts与 父txn op的snapshot ts 相同,则其能看到global txn op workspace 中的 数据.
 
- 从snapshot db 中 可以open 一个 snapshot table, 之后可以调用Relation 相关的接口:
+  sql layer通过调用Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot op与snapshot database 绑定;
 
-```go
-type Statistics interface {
-	Stats(ctx context.Context, sync bool) *pb.StatsInfo
-	Rows(ctx context.Context) (uint64, error)
-	Size(ctx context.Context, columnName string) (uint64, error)
-}
+  snapshot op 会与其父op共享同一个Transaction对象, 但是其会有独立的snapshot data, 以便服务历史数据的读取.
 
-
-type Relation interface {
-	Statistics
-  
-	UpdateObjectInfos(context.Context) error //
-
-	Ranges(context.Context, []*plan.Expr) (Ranges, error)
-
-	TableDefs(context.Context) ([]TableDef, error)
-
-	// Get complete tableDef information, including columns, constraints, partitions, version, comments, etc
-	GetTableDef(context.Context) *plan.TableDef
-	CopyTableDef(context.Context) *plan.TableDef
-
-	GetPrimaryKeys(context.Context) ([]*Attribute, error)
-
-	GetHideKeys(context.Context) ([]*Attribute, error)
-
-	GetTableID(context.Context) uint64
-
-	// GetTableName returns the name of the table.
-	GetTableName() string
-
-	GetDBID(context.Context) uint64
-
-	// second argument is the number of reader, third argument is the filter extend, foruth parameter is the payload required by the engine
-	NewReader(context.Context, int, *plan.Expr, []byte, bool) ([]Reader, error)
-
-	TableColumns(ctx context.Context) ([]*Attribute, error)
-
-	//max and min values
-	MaxAndMinValues(ctx context.Context) ([][2]any, []uint8, error)
-
-	GetEngineType() EngineType
-
-	GetColumMetadataScanInfo(ctx context.Context, name string) ([]*plan.MetadataScanInfo, error)
-
-	// PrimaryKeysMayBeModified reports whether any rows with any primary keys in keyVector was modified during `from` to `to`
-	// If not sure, returns true
-	// Initially added for implementing locking rows by primary keys
-	PrimaryKeysMayBeModified(ctx context.Context, from types.TS, to types.TS, keyVector *vector.Vector) (bool, error)
-}
-
-```
-
-
-
-##### 2.2.2.2 reader  相关修改
-
-   Relation.NewReader ，partition reader  , block merge reader 需要修改.
+##### 2.2.2.2 reader相关修改
+   接口暂时不需要改动, 实现上改动比较小.
 
 ##### 2.2.2.3 distae 从TN获取CKP
 
@@ -281,7 +162,7 @@ type Relation interface {
 
 ##### 2.2.2.4 disttae 与TN 接口
 
-disttae 需要从TN 拉取 旧的ckp 数据及logtail , 建议用pull 方式, 可以复用以下code:
+disttae 需要从TN 拉取 旧的ckp 数据及logtail , 建议用pull, non-lazyload 方式, 可以复用之前的code:
 
 
 ```go
@@ -320,8 +201,6 @@ func updatePartitionOfPull(
 }
 
 ```
-
-
 
 #### 2.2.2  Parser 设计
 
@@ -372,10 +251,10 @@ func updatePartitionOfPull(
 
 #### 2.2.4 Plan 设计
     // 主要是修改
-	buildFrom:
-	   buildTable:
-	       *tree.TableName
-		   //在Node中增加snapshotTs信息
+    buildFrom:
+       buildTable:
+           *tree.TableName
+    	   //在Node中增加snapshotTs信息
 
 
 
