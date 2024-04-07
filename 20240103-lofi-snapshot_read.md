@@ -109,6 +109,7 @@ snapshot的创建，查询，删除。
   disttae engine 全局只有一个.
 
   在快照读功能之前，一个事务只有一个 TxnOperator, 且TxnOperator 对象 与 disttae.Transaction 对象一一对应;
+  
   在快照读功能之后，一个事务会有多个TxnOperator 对象. 每个TxnOperator 对象与 disttae.Transaction 对象 一 一 对应. 
 
 
