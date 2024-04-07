@@ -118,7 +118,7 @@ snapshot的创建，查询，删除。
 ```go
 type TxnOp interface {
 	//clone read-only snapshot op from parent op.
-    CloneSnapshotOp(snapshot types.TS) TxnOp
+    CloneSnapshotOp(snapshot timestamp.Timestamp) TxnOp
 }
 ```
   CloneSnapshotOp 通过global TxnOperator clone出一个新的snapshot TxnOperator,其snapshot ts 由用户指定，用于读取快照数据,这个
