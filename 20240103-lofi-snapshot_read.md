@@ -95,20 +95,21 @@ snapshot的创建，查询，删除。
 
   **latest snapshot** : distate 中最新的快照数据，是基于最新的checkpoint + logtail apply 之后生成的.
 
-  **global txn op** :  用户每开启一个事务，需要创建一个global txn op, 其负责事务的提交，与TN 之间交互等.
-                              如果事务需要进行快照读，需要clone出一个新的snapshot op, 用于读取快照数据, 
+  **global txn op** :  用户每开启一个事务，需要创建一个global TxnOperator 对象, 其负责事务的提交，与TN 之间交互等.
+                        如果事务需要进行快照读，需要clone出一个新的snapshot TxnOperator 对象, 用于读取快照数据, 
+			且这个snapshot TxnOperator 是只读的.
 
-​                            一个global txn op 中可以clone多个snapshot op.
+​                        一个global TxnOperator  中可以clone多个snapshot TxnOperator 对象.
 
   disttae 中对于每个snapshot 会对应一个独立的状态机，用于存储快照数据, latest snapshot 只是snapshot的特例.  如果快照读需要历史数据， distate会从TN中拉取，并apply到每个snapshot对应的状态机中; 
   如果请求的数据版本在当前CN latest snapshot 中已经存在，可以复用已有状态机. disttae 中 snapshot 的释放策略待定.
 
-  当事务进行快照读时，sql  layer应调用txnOp.CloneSnapshotOp() 生成一个新的snapshot op, 用于读取快照数据, 并通过调用  Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot op 与 snapshot database 绑定;  调用snapshotDb.Relation(..., tableName) open 一个snapshot table 对象，最后通过调用snapshotTable.NewReader(...)  生成一个snapshot reader对象读取snapshot数据.
+  当事务进行快照读时，sql  layer应调用txnOp.CloneSnapshotOp() 生成一个新的snapshot TxnOperator, 用于读取快照数据, 并通过调用  Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot op 与 snapshot database 绑定;  调用snapshotDb.Relation(..., tableName) open 一个snapshot table 对象，最后通过调用snapshotTable.NewReader(...)  生成一个snapshot reader对象读取snapshot数据.
 
   disttae engine 全局只有一个.
 
-  在快照读功能之前，一个事务只有一个 txn op, 且txn op 与 distate.Transaction 对象一一对应;
-  在快照读功能之后，一个事务会有多个txn op 对象，distate.Transaction 对象与txn op 为一对多关系.
+  在快照读功能之前，一个事务只有一个 TxnOperator, 且TxnOperator 对象 与 disttae.Transaction 对象一一对应;
+  在快照读功能之后，一个事务会有多个TxnOperator 对象. 每个TxnOperator 对象与 disttae.Transaction 对象 一 一 对应. 
 
 
 ##### 2.2.1.1 TxnOp 中增加CloneSnapshotOp 接口
@@ -119,11 +120,11 @@ type TxnOp interface {
     CloneSnapshotOp(snapshot types.TS) TxnOp
 }
 ```
-  CloneSnapshotOp 通过global TxnOp clone出一个新的snapshot op,其snapshot ts 由用户指定，用于读取快照数据, 如果用户指定的snapshot ts与 父txn op的snapshot ts 相同,则其能看到global txn op workspace 中的 数据.
+  CloneSnapshotOp 通过global TxnOperator clone出一个新的snapshot TxnOperator,其snapshot ts 由用户指定，用于读取快照数据,这个
+  snapshot TxnOperator 是只读的.
 
-  sql layer通过调用Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot op与snapshot database 绑定;
+  sql layer通过调用Engine.Database(..., snapshotOp) open 一个snapshot database 对象, distate 会将snapshot TxnOperator与snapshot database 绑定;
 
-  snapshot op 会与其父op共享同一个Transaction对象, 但是其会有独立的snapshot data, 以便服务历史数据的读取.
 
 ##### 2.2.2.2 reader相关修改
    接口暂时不需要改动, 实现上改动比较小.
